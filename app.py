@@ -309,11 +309,38 @@ def build_news_documents(articles, company_name):
     return docs
 
 
+def _wipe_persist_dir():
+    shutil.rmtree(PERSIST_DIR, ignore_errors=True)
+    os.makedirs(PERSIST_DIR, exist_ok=True)
+
+
+def _write_chunks_to_chroma(chunks, retry_on_readonly=True):
+    """Create a fresh Chroma store at PERSIST_DIR and write chunks to it.
+    If the on-disk DB is stuck in a readonly/corrupted state (e.g. leftover
+    lock/file from a crashed run, or a permissions problem), wipe the
+    persist dir once more and retry before giving up with a clear error."""
+    embedding_model = get_embedding_model()
+    try:
+        vectorstore = Chroma(persist_directory=PERSIST_DIR, embedding_function=embedding_model)
+        vectorstore.add_documents(chunks)
+    except Exception as e:
+        is_readonly_error = "readonly database" in str(e).lower() or "code: 1032" in str(e)
+        if retry_on_readonly and is_readonly_error:
+            _wipe_persist_dir()
+            _write_chunks_to_chroma(chunks, retry_on_readonly=False)
+        else:
+            raise RuntimeError(
+                f"Vector store write failed: {e}. If this keeps happening, the app's "
+                f"working directory may not be writable — check permissions on "
+                f"'{PERSIST_DIR}' (or its parent folder) or free up disk space."
+            ) from e
+
+
 def index_company_news(company_name, chunk_size, chunk_overlap):
     all_articles = fetch_all_articles()
     matches = filter_articles_for_company(all_articles, company_name)
     if not matches:
-        return 0, [], len(all_articles)
+        return 0, [], len(all_articles), None
 
     docs = build_news_documents(matches, company_name)
     splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
@@ -323,17 +350,17 @@ def index_company_news(company_name, chunk_size, chunk_overlap):
     # company's chunks before adding the new ones, otherwise Chroma just
     # accumulates documents across runs and the retriever can pull back
     # unrelated articles from a company indexed earlier in the session.
-    shutil.rmtree(PERSIST_DIR, ignore_errors=True)
-    os.makedirs(PERSIST_DIR, exist_ok=True)
+    _wipe_persist_dir()
 
-    embedding_model = get_embedding_model()
-    vectorstore = Chroma(persist_directory=PERSIST_DIR, embedding_function=embedding_model)
-    vectorstore.add_documents(chunks)
+    try:
+        _write_chunks_to_chroma(chunks)
+    except Exception as e:
+        return 0, matches, len(all_articles), str(e)
 
     st.session_state.vectorstore_ready = True
     st.session_state.indexed_company = company_name
     st.session_state.last_articles = matches
-    return len(chunks), matches, len(all_articles)
+    return len(chunks), matches, len(all_articles), None
 
 
 def load_existing_vectorstore():
@@ -444,14 +471,19 @@ with st.sidebar:
     if st.button("📡 Fetch & index news", disabled=not company_valid):
         with st.spinner(f"Pulling the latest feed and filtering for '{company_name_clean}'..."):
             try:
-                n_chunks, matches, total_fetched = index_company_news(
+                n_chunks, matches, total_fetched, err = index_company_news(
                     company_name_clean, chunk_size, chunk_overlap
                 )
             except Exception as e:
-                st.error(f"Could not reach the news API: {e}")
-                n_chunks, matches, total_fetched = 0, [], 0
+                # Fetch itself failed (network / API) before we ever got articles.
+                n_chunks, matches, total_fetched, err = 0, [], 0, f"Could not reach the news API: {e}"
+
         if n_chunks:
             st.success(f"Indexed {n_chunks} chunks from {len(matches)} matching article(s) (out of {total_fetched} fetched).")
+        elif err:
+            # A real failure occurred (fetch or vector-store write) — don't
+            # also claim "no articles found", that would be misleading.
+            st.error(err)
         elif total_fetched:
             st.warning(
                 f"No articles specifically about '{company_name_clean}' were found in the latest {total_fetched} articles. "
