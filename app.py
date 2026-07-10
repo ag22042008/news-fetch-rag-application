@@ -246,36 +246,24 @@ def is_single_company_name(raw_input):
     return len(parts) == 1
 
 
+
+
 def filter_articles_for_company(articles, company_name):
-    """
-    Strict client-side filter: keep only articles that are genuinely about
-    the given company, not articles that merely contain the company name as
-    an incidental substring somewhere in the payload.
-
-    Compared to a naive substring check, this:
-      - Uses whole-word, case-insensitive regex matching (\\b...\\b), so a
-        company like "Ford" won't match "Oxford", "Meta" won't match
-        "Metadata", etc.
-      - Only searches the title and description — the fields that actually
-        describe what the article is about. The `source` field (e.g. "BBC",
-        "TechCrunch") and generic `keywords`/`category` tags are deliberately
-        excluded, since a match there is not reliable evidence the article
-        is actually about the company (it can be an unrelated article that
-        happens to share a tag, or a news outlet whose name overlaps).
-    """
-    needle = company_name.strip()
-    if not needle:
-        return []
-
-    pattern = re.compile(r"\b" + re.escape(needle) + r"\b", re.IGNORECASE)
+    pattern = re.compile(rf"\b{re.escape(company_name)}\b", re.IGNORECASE)
 
     matches = []
-    for a in articles:
-        title = a.get("title", "") or ""
-        description = a.get("description", "") or ""
 
-        if pattern.search(title) or pattern.search(description):
-            matches.append(a)
+    for article in articles:
+        title = article.get("title", "")
+        description = article.get("description", "")
+
+        # Strong preference: company must appear in title
+        if pattern.search(title):
+            matches.append(article)
+
+        # Otherwise allow description only if title doesn't mention another company
+        elif pattern.search(description):
+            matches.append(article)
 
     return matches
 
