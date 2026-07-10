@@ -15,16 +15,6 @@ load_dotenv()
 
 st.set_page_config(page_title="NewsDesk AI", page_icon="📰", layout="wide")
 
-# ============================================================================
-# Backend news source
-# ----------------------------------------------------------------------------
-# This API returns a fixed batch of the ~100 latest articles across ALL topics
-# and sources (BBC, TechCrunch, Al Jazeera, Marketaux, Finnhub, SEC EDGAR,
-# Reddit, Hacker News, etc.) — query params like ?q= or ?limit= are ignored.
-# So we fetch the whole batch once and filter client-side by company name
-# against title / description (NOT source/keywords/category — see
-# filter_articles_for_company for why).
-# ============================================================================
 NEWS_API_URL = "https://news-pipeline-iqtb.onrender.com/api/articles"
 
 SUGGESTED_QUESTIONS = [
@@ -37,9 +27,7 @@ SUGGESTED_QUESTIONS = [
 ]
 
 
-# ============================
-# API key resolution
-# ============================
+
 def get_mistral_api_key():
     key = None
     try:
@@ -64,9 +52,6 @@ if not MISTRAL_API_KEY:
     )
     st.stop()
 
-# ============================
-# Prompt
-# ============================
 PROMPT = ChatPromptTemplate.from_messages(
     [
         (
@@ -99,9 +84,7 @@ Question
     ]
 )
 
-# ==================================================================================
-# STYLE — "NewsDesk": ink/paper archive language, newsroom-flavored
-# ==================================================================================
+
 st.markdown(
     """
 <style>
@@ -204,9 +187,7 @@ div[data-testid="stChatInput"] textarea { color: var(--chalk) !important; }
 )
 
 
-# ============================
-# Cached resources
-# ============================
+
 @st.cache_resource
 def get_embedding_model():
     return MistralAIEmbeddings(api_key=MISTRAL_API_KEY)
@@ -230,9 +211,7 @@ def clean_html(text):
     return BeautifulSoup(text, "html.parser").get_text(" ", strip=True)
 
 
-# ============================
-# Single-company input validation
-# ============================
+
 _MULTI_COMPANY_SEPARATORS = re.compile(r"\s*(?:,|;|/|\band\b|\bor\b|&)\s*", re.IGNORECASE)
 
 
@@ -382,9 +361,7 @@ if "last_articles" not in st.session_state:
 if "pending_query" not in st.session_state:
     st.session_state.pending_query = None
 
-# ============================
-# Sidebar
-# ============================
+
 with st.sidebar:
     st.markdown("## ① Fetch company news")
     company_name = st.text_input(
@@ -457,9 +434,6 @@ with st.sidebar:
             st.session_state.messages = []
             st.rerun()
 
-# ============================
-# Header
-# ============================
 st.markdown(
     """
 <div class="nd-header">
