@@ -1,6 +1,7 @@
 import os
-import re
 import shutil
+import xml.etree.ElementTree as ET
+from urllib.parse import quote
 
 import requests
 import streamlit as st
@@ -21,13 +22,11 @@ PERSIST_DIR = "news_chroma_db"
 # ============================================================================
 # Backend news source
 # ----------------------------------------------------------------------------
-# This API returns a fixed batch of the ~100 latest articles across ALL topics
-# and sources (BBC, TechCrunch, Al Jazeera, Marketaux, Finnhub, SEC EDGAR,
-# Reddit, Hacker News, etc.) — query params like ?q= or ?limit= are ignored.
-# So we fetch the whole batch once and filter client-side by company name
-# against title / description / keywords / category / source.
+# Google News RSS returns XML (not JSON), and it already filters server-side
+# via the `q=` query param, so we no longer need a client-side filter step.
+# The feed gives titles/snippets/links, not full article bodies.
 # ============================================================================
-NEWS_API_URL = "https://news.google.com/rss/search?q={company}"
+NEWS_API_URL = "https://news.google.com/rss/search?q={company}&hl=en-US&gl=US&ceid=US:en"
 
 SUGGESTED_QUESTIONS = [
     "Summarize the latest news.",
@@ -218,37 +217,51 @@ def get_llm(model_name, temperature):
     return ChatMistralAI(model=model_name, temperature=temperature, api_key=MISTRAL_API_KEY)
 
 
-def fetch_all_articles():
-    """Pull the fixed batch of latest articles from the backend API."""
-    resp = requests.get(NEWS_API_URL, timeout=15)
+def fetch_all_articles(company_name):
+    """Fetch and parse the Google News RSS feed for a given company.
+
+    Google News RSS already filters server-side via the `q=` param, so this
+    returns only articles relevant to `company_name` (no client-side filter
+    needed). Note the feed provides title/snippet/link only — not full
+    article bodies.
+    """
+    url = NEWS_API_URL.format(company=quote(company_name))
+    resp = requests.get(url, timeout=15)
     resp.raise_for_status()
-    payload = resp.json()
-    return payload.get("data", [])
+
+    root = ET.fromstring(resp.content)
+    items = root.findall("./channel/item")
+
+    articles = []
+    for item in items:
+        title = (item.findtext("title") or "Untitled").strip()
+        link = (item.findtext("link") or "").strip()
+        pub_date = (item.findtext("pubDate") or "Unknown date").strip()
+        description = clean_html(item.findtext("description") or "")
+        source_el = item.find("source")
+        source_name = (
+            source_el.text.strip() if source_el is not None and source_el.text else "Unknown"
+        )
+
+        articles.append(
+            {
+                "title": title,
+                "description": description,
+                "content": "",  # RSS feed has no full article body
+                "keywords": [],
+                "url": link,
+                "source": source_name,
+                "published_at": pub_date,
+                "sentiment": {"polarity": None},
+            }
+        )
+    return articles
 
 
 def clean_html(text):
     if not text:
         return ""
     return BeautifulSoup(text, "html.parser").get_text(" ", strip=True)
-
-
-def filter_articles_for_company(articles, company_name):
-    """Client-side filter, since the API doesn't support server-side search."""
-    needle = company_name.strip().lower()
-    matches = []
-    for a in articles:
-        haystack = " ".join(
-            [
-                a.get("title", "") or "",
-                a.get("description", "") or "",
-                a.get("category", "") or "",
-                a.get("source", "") or "",
-                " ".join(a.get("keywords", []) or []),
-            ]
-        ).lower()
-        if needle in haystack:
-            matches.append(a)
-    return matches
 
 
 def build_news_documents(articles):
@@ -277,10 +290,9 @@ def build_news_documents(articles):
 
 
 def index_company_news(company_name, chunk_size, chunk_overlap):
-    all_articles = fetch_all_articles()
-    matches = filter_articles_for_company(all_articles, company_name)
+    matches = fetch_all_articles(company_name)
     if not matches:
-        return 0, [], len(all_articles)
+        return 0, [], 0
 
     docs = build_news_documents(matches)
     splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
@@ -293,7 +305,7 @@ def index_company_news(company_name, chunk_size, chunk_overlap):
     st.session_state.vectorstore_ready = True
     st.session_state.indexed_company = company_name
     st.session_state.last_articles = matches
-    return len(chunks), matches, len(all_articles)
+    return len(chunks), matches, len(matches)
 
 
 def load_existing_vectorstore():
@@ -390,11 +402,11 @@ with st.sidebar:
                 st.error(f"Could not reach the news API: {e}")
                 n_chunks, matches, total_fetched = 0, [], 0
         if n_chunks:
-            st.success(f"Indexed {n_chunks} chunks from {len(matches)} matching article(s) (out of {total_fetched} fetched).")
-        elif total_fetched:
+            st.success(f"Indexed {n_chunks} chunks from {len(matches)} matching article(s).")
+        else:
             st.warning(
-                f"No articles mentioning '{company_name}' were found in the latest {total_fetched} articles. "
-                "The feed only covers recent general news, not a full historical company search."
+                f"No articles mentioning '{company_name}' were found in the news feed. "
+                "Try a different name or check the spelling."
             )
 
     if st.session_state.indexed_company:
@@ -439,8 +451,8 @@ st.markdown(
 )
 
 st.markdown(
-    '<div class="nd-warn">Note: the news feed only returns the latest ~100 articles across all topics — '
-    "it's not a full historical search. If a company hasn't been in recent headlines, no matches will be found.</div>",
+    '<div class="nd-warn">Note: the news feed returns recent Google News results for your search term — '
+    "it's not a full historical archive, and article snippets (not full text) are what gets indexed.</div>",
     unsafe_allow_html=True,
 )
 
@@ -455,7 +467,7 @@ if not st.session_state.vectorstore_ready:
 if st.session_state.last_articles:
     with st.expander(f"📰 Articles matched for {st.session_state.indexed_company} ({len(st.session_state.last_articles)})"):
         for a in st.session_state.last_articles:
-            sentiment = (a.get("sentiment") or {}).get("polarity", 0.0)
+            sentiment = (a.get("sentiment") or {}).get("polarity") or 0.0
             st.markdown(
                 f"""<div class="nd-article-row">
                 <a href="{a.get('url', '')}" target="_blank">{a.get('title', 'Untitled')}</a><br>
