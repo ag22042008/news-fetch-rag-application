@@ -27,7 +27,7 @@ PERSIST_DIR = "news_chroma_db"
 # So we fetch the whole batch once and filter client-side by company name
 # against title / description / keywords / category / source.
 # ============================================================================
-NEWS_API_URL = "https://news-pipeline-iqtb.onrender.com/api/articles"
+NEWS_API_URL = ""https://news.google.com/rss/search?q={company}""
 
 SUGGESTED_QUESTIONS = [
     "Summarize the latest news.",
