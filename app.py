@@ -1,7 +1,5 @@
 import os
 import re
-import shutil
-import tempfile
 
 import requests
 import streamlit as st
@@ -16,11 +14,6 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 load_dotenv()
 
 st.set_page_config(page_title="NewsDesk AI", page_icon="📰", layout="wide")
-
-# Use a directory under the OS temp dir rather than a relative path, since
-# some hosting environments (containers, certain PaaS setups) mount the
-# app's working directory read-only and only allow writes under /tmp.
-PERSIST_DIR = os.path.join(tempfile.gettempdir(), "newsdesk_chroma_db")
 
 # ============================================================================
 # Backend news source
@@ -313,84 +306,35 @@ def build_news_documents(articles, company_name):
     return docs
 
 
-def _wipe_persist_dir():
-    shutil.rmtree(PERSIST_DIR, ignore_errors=True)
-    os.makedirs(PERSIST_DIR, exist_ok=True)
-
-
-def _write_chunks_to_chroma(chunks, retry_on_readonly=True):
-    """Create a fresh Chroma store at PERSIST_DIR and write chunks to it.
-    If the on-disk DB is stuck in a readonly/corrupted state (e.g. leftover
-    lock/file from a crashed run, or a permissions problem), wipe the
-    persist dir once more and retry before giving up with a clear error."""
-    embedding_model = get_embedding_model()
-    try:
-        vectorstore = Chroma(persist_directory=PERSIST_DIR, embedding_function=embedding_model)
-        vectorstore.add_documents(chunks)
-    except Exception as e:
-        is_readonly_error = "readonly database" in str(e).lower() or "code: 1032" in str(e)
-        if retry_on_readonly and is_readonly_error:
-            _wipe_persist_dir()
-            _write_chunks_to_chroma(chunks, retry_on_readonly=False)
-        else:
-            raise RuntimeError(
-                f"Vector store write failed: {e}. If this keeps happening, the app's "
-                f"working directory may not be writable — check permissions on "
-                f"'{PERSIST_DIR}' (or its parent folder) or free up disk space."
-            ) from e
-
-
 def index_company_news(company_name, chunk_size, chunk_overlap):
+    """Fetch + filter + embed a single company's articles into a fresh,
+    in-memory Chroma collection (no disk persistence — this app is meant to
+    analyze whatever was just fetched, not keep a durable archive, so there
+    is nothing to gain from writing to disk and it removes an entire class
+    of readonly-database / permissions failures)."""
     all_articles = fetch_all_articles()
     matches = filter_articles_for_company(all_articles, company_name)
     if not matches:
-        return 0, [], len(all_articles), None
+        return None, [], len(all_articles), None
 
     docs = build_news_documents(matches, company_name)
     splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
     chunks = splitter.split_documents(docs)
 
-    # This app analyzes ONE company at a time. Wipe any previously indexed
-    # company's chunks before adding the new ones, otherwise Chroma just
-    # accumulates documents across runs and the retriever can pull back
-    # unrelated articles from a company indexed earlier in the session.
-    _wipe_persist_dir()
-
     try:
-        _write_chunks_to_chroma(chunks)
-    except Exception as e:
-        return 0, matches, len(all_articles), str(e)
-
-    st.session_state.vectorstore_ready = True
-    st.session_state.indexed_company = company_name
-    st.session_state.last_articles = matches
-    return len(chunks), matches, len(all_articles), None
-
-
-def load_existing_vectorstore():
-    if os.path.isdir(PERSIST_DIR) and os.listdir(PERSIST_DIR):
         embedding_model = get_embedding_model()
-        vs = Chroma(persist_directory=PERSIST_DIR, embedding_function=embedding_model)
-        try:
-            if vs._collection.count() > 0:
-                return True
-        except Exception:
-            pass
-    return False
+        # No persist_directory => in-memory only, scoped to this session.
+        vectorstore = Chroma.from_documents(chunks, embedding=embedding_model)
+    except Exception as e:
+        return None, matches, len(all_articles), f"Could not build the vector index: {e}"
+
+    return vectorstore, matches, len(all_articles), None
 
 
-def get_retriever(k, fetch_k, lambda_mult, company_name=None):
-    embedding_model = get_embedding_model()
-    vectorstore = Chroma(persist_directory=PERSIST_DIR, embedding_function=embedding_model)
-    search_kwargs = {"k": k, "fetch_k": fetch_k, "lambda_mult": lambda_mult}
-    if company_name:
-        # Defense in depth: even though the store is wiped per company on
-        # index, this guarantees retrieval never crosses into another
-        # company's chunks if that invariant is ever broken.
-        search_kwargs["filter"] = {"company": company_name}
+def get_retriever(vectorstore, k, fetch_k, lambda_mult):
     return vectorstore.as_retriever(
         search_type="mmr",
-        search_kwargs=search_kwargs,
+        search_kwargs={"k": k, "fetch_k": fetch_k, "lambda_mult": lambda_mult},
     )
 
 
@@ -441,8 +385,8 @@ def render_slips(docs):
 # ============================
 if "messages" not in st.session_state:
     st.session_state.messages = []
-if "vectorstore_ready" not in st.session_state:
-    st.session_state.vectorstore_ready = load_existing_vectorstore()
+if "vectorstore" not in st.session_state:
+    st.session_state.vectorstore = None
 if "indexed_company" not in st.session_state:
     st.session_state.indexed_company = None
 if "last_articles" not in st.session_state:
@@ -475,18 +419,23 @@ with st.sidebar:
     if st.button("📡 Fetch & index news", disabled=not company_valid):
         with st.spinner(f"Pulling the latest feed and filtering for '{company_name_clean}'..."):
             try:
-                n_chunks, matches, total_fetched, err = index_company_news(
+                vectorstore, matches, total_fetched, err = index_company_news(
                     company_name_clean, chunk_size, chunk_overlap
                 )
             except Exception as e:
                 # Fetch itself failed (network / API) before we ever got articles.
-                n_chunks, matches, total_fetched, err = 0, [], 0, f"Could not reach the news API: {e}"
+                vectorstore, matches, total_fetched, err = None, [], 0, f"Could not reach the news API: {e}"
 
-        if n_chunks:
-            st.success(f"Indexed {n_chunks} chunks from {len(matches)} matching article(s) (out of {total_fetched} fetched).")
+        if vectorstore is not None:
+            # Fresh analysis: replace whatever was indexed before.
+            st.session_state.vectorstore = vectorstore
+            st.session_state.indexed_company = company_name_clean
+            st.session_state.last_articles = matches
+            st.session_state.messages = []
+            st.success(f"Indexed {len(matches)} matching article(s) (out of {total_fetched} fetched).")
         elif err:
-            # A real failure occurred (fetch or vector-store write) — don't
-            # also claim "no articles found", that would be misleading.
+            # A real failure occurred (fetch or embedding) — don't also
+            # claim "no articles found", that would be misleading.
             st.error(err)
         elif total_fetched:
             st.warning(
@@ -506,7 +455,7 @@ with st.sidebar:
     lambda_mult = st.slider("Relevance ↔ Diversity", 0.0, 1.0, 0.7)
 
     st.markdown('<hr class="nd-rule">', unsafe_allow_html=True)
-    st.caption(f"VECTOR STORE: `{PERSIST_DIR}`")
+    st.caption("VECTOR STORE: in-memory (this session only, nothing written to disk)")
     col1, col2 = st.columns(2)
     with col1:
         if st.button("Clear chat"):
@@ -514,8 +463,7 @@ with st.sidebar:
             st.rerun()
     with col2:
         if st.button("Reset archive"):
-            shutil.rmtree(PERSIST_DIR, ignore_errors=True)
-            st.session_state.vectorstore_ready = False
+            st.session_state.vectorstore = None
             st.session_state.indexed_company = None
             st.session_state.last_articles = []
             st.session_state.messages = []
@@ -538,11 +486,11 @@ st.markdown(
 st.markdown(
     '<div class="nd-warn">Note: the news feed only returns the latest ~100 articles across all topics — '
     "it's not a full historical search. If a company hasn't been in recent headlines, no matches will be found. "
-    "Analysis is always scoped to exactly one company at a time.</div>",
+    "Analysis is always scoped to exactly one company at a time, and is not saved between sessions.</div>",
     unsafe_allow_html=True,
 )
 
-if not st.session_state.vectorstore_ready:
+if st.session_state.vectorstore is None:
     st.markdown(
         '<div class="nd-empty">No news indexed yet.<br>Type a single company name in the sidebar and click '
         '<b>Fetch &amp; index news</b> to begin.</div>',
@@ -569,7 +517,7 @@ for i, q in enumerate(SUGGESTED_QUESTIONS):
         st.session_state.pending_query = q
 
 try:
-    retriever = get_retriever(k, fetch_k, lambda_mult, st.session_state.indexed_company)
+    retriever = get_retriever(st.session_state.vectorstore, k, fetch_k, lambda_mult)
     llm = get_llm(model_name, temperature)
 except Exception as e:
     st.error(f"Could not reach the model or vector store: {e}")
