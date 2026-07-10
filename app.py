@@ -1,6 +1,7 @@
 import os
 import re
 import shutil
+import tempfile
 
 import requests
 import streamlit as st
@@ -16,7 +17,10 @@ load_dotenv()
 
 st.set_page_config(page_title="NewsDesk AI", page_icon="📰", layout="wide")
 
-PERSIST_DIR = "news_chroma_db"
+# Use a directory under the OS temp dir rather than a relative path, since
+# some hosting environments (containers, certain PaaS setups) mount the
+# app's working directory read-only and only allow writes under /tmp.
+PERSIST_DIR = os.path.join(tempfile.gettempdir(), "newsdesk_chroma_db")
 
 # ============================================================================
 # Backend news source
