@@ -283,7 +283,7 @@ def filter_articles_for_company(articles, company_name):
     return matches
 
 
-def build_news_documents(articles):
+def build_news_documents(articles, company_name):
     docs = []
     for a in articles:
         title = a.get("title", "Untitled")
@@ -302,6 +302,7 @@ def build_news_documents(articles):
                     "source_name": a.get("source", "Unknown"),
                     "published": a.get("published_at", "Unknown date"),
                     "sentiment_polarity": (a.get("sentiment") or {}).get("polarity"),
+                    "company": company_name,
                 },
             )
         )
@@ -314,9 +315,16 @@ def index_company_news(company_name, chunk_size, chunk_overlap):
     if not matches:
         return 0, [], len(all_articles)
 
-    docs = build_news_documents(matches)
+    docs = build_news_documents(matches, company_name)
     splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
     chunks = splitter.split_documents(docs)
+
+    # This app analyzes ONE company at a time. Wipe any previously indexed
+    # company's chunks before adding the new ones, otherwise Chroma just
+    # accumulates documents across runs and the retriever can pull back
+    # unrelated articles from a company indexed earlier in the session.
+    shutil.rmtree(PERSIST_DIR, ignore_errors=True)
+    os.makedirs(PERSIST_DIR, exist_ok=True)
 
     embedding_model = get_embedding_model()
     vectorstore = Chroma(persist_directory=PERSIST_DIR, embedding_function=embedding_model)
@@ -340,12 +348,18 @@ def load_existing_vectorstore():
     return False
 
 
-def get_retriever(k, fetch_k, lambda_mult):
+def get_retriever(k, fetch_k, lambda_mult, company_name=None):
     embedding_model = get_embedding_model()
     vectorstore = Chroma(persist_directory=PERSIST_DIR, embedding_function=embedding_model)
+    search_kwargs = {"k": k, "fetch_k": fetch_k, "lambda_mult": lambda_mult}
+    if company_name:
+        # Defense in depth: even though the store is wiped per company on
+        # index, this guarantees retrieval never crosses into another
+        # company's chunks if that invariant is ever broken.
+        search_kwargs["filter"] = {"company": company_name}
     return vectorstore.as_retriever(
         search_type="mmr",
-        search_kwargs={"k": k, "fetch_k": fetch_k, "lambda_mult": lambda_mult},
+        search_kwargs=search_kwargs,
     )
 
 
@@ -519,7 +533,7 @@ for i, q in enumerate(SUGGESTED_QUESTIONS):
         st.session_state.pending_query = q
 
 try:
-    retriever = get_retriever(k, fetch_k, lambda_mult)
+    retriever = get_retriever(k, fetch_k, lambda_mult, st.session_state.indexed_company)
     llm = get_llm(model_name, temperature)
 except Exception as e:
     st.error(f"Could not reach the model or vector store: {e}")
