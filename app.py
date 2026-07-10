@@ -25,7 +25,8 @@ PERSIST_DIR = "news_chroma_db"
 # and sources (BBC, TechCrunch, Al Jazeera, Marketaux, Finnhub, SEC EDGAR,
 # Reddit, Hacker News, etc.) — query params like ?q= or ?limit= are ignored.
 # So we fetch the whole batch once and filter client-side by company name
-# against title / description / keywords / category / source.
+# against title / description (NOT source/keywords/category — see
+# filter_articles_for_company for why).
 # ============================================================================
 NEWS_API_URL = "https://news-pipeline-iqtb.onrender.com/api/articles"
 
@@ -232,22 +233,53 @@ def clean_html(text):
     return BeautifulSoup(text, "html.parser").get_text(" ", strip=True)
 
 
+# ============================
+# Single-company input validation
+# ============================
+_MULTI_COMPANY_SEPARATORS = re.compile(r"\s*(?:,|;|/|\band\b|\bor\b|&)\s*", re.IGNORECASE)
+
+
+def is_single_company_name(raw_input):
+    """Reject input that looks like more than one company name, so an
+    analysis run is always scoped to exactly one company."""
+    cleaned = raw_input.strip()
+    if not cleaned:
+        return False
+    parts = [p for p in _MULTI_COMPANY_SEPARATORS.split(cleaned) if p.strip()]
+    return len(parts) == 1
+
+
 def filter_articles_for_company(articles, company_name):
-    """Client-side filter, since the API doesn't support server-side search."""
-    needle = company_name.strip().lower()
+    """
+    Strict client-side filter: keep only articles that are genuinely about
+    the given company, not articles that merely contain the company name as
+    an incidental substring somewhere in the payload.
+
+    Compared to a naive substring check, this:
+      - Uses whole-word, case-insensitive regex matching (\\b...\\b), so a
+        company like "Ford" won't match "Oxford", "Meta" won't match
+        "Metadata", etc.
+      - Only searches the title and description — the fields that actually
+        describe what the article is about. The `source` field (e.g. "BBC",
+        "TechCrunch") and generic `keywords`/`category` tags are deliberately
+        excluded, since a match there is not reliable evidence the article
+        is actually about the company (it can be an unrelated article that
+        happens to share a tag, or a news outlet whose name overlaps).
+    """
+    needle = company_name.strip()
+    if not needle:
+        return []
+
+    pattern = re.compile(r"\b" + re.escape(needle) + r"\b", re.IGNORECASE)
+
     matches = []
     for a in articles:
-        haystack = " ".join(
-            [
-                a.get("title", "") or "",
-                a.get("description", "") or "",
-                a.get("category", "") or "",
-                a.get("source", "") or "",
-                " ".join(a.get("keywords", []) or []),
-            ]
-        ).lower()
-        if needle in haystack:
+        title = a.get("title", "") or ""
+        description = a.get("description", "") or ""
+
+        if pattern.search(title) or pattern.search(description):
             matches.append(a)
+
     return matches
 
 
@@ -378,14 +410,29 @@ if "pending_query" not in st.session_state:
 # ============================
 with st.sidebar:
     st.markdown("## ① Fetch company news")
-    company_name = st.text_input("Company name", placeholder="e.g. Tesla, Duolingo, Microsoft")
+    company_name = st.text_input(
+        "Company name",
+        placeholder="e.g. Tesla, Duolingo, Microsoft",
+        help="Enter exactly ONE company. The analysis will be scoped strictly to that company's articles.",
+    )
+
+    company_name_clean = company_name.strip()
+    company_valid = bool(company_name_clean) and is_single_company_name(company_name_clean)
+    if company_name_clean and not company_valid:
+        st.warning(
+            "Please enter only **one** company name (no commas, '&', 'and'/'or'). "
+            "Analysis is scoped to a single company at a time."
+        )
+
     chunk_size = st.number_input("Chunk size", min_value=200, max_value=4000, value=800, step=100)
     chunk_overlap = st.number_input("Chunk overlap", min_value=0, max_value=1000, value=150, step=50)
 
-    if st.button("📡 Fetch & index news", disabled=not company_name):
-        with st.spinner(f"Pulling the latest feed and filtering for '{company_name}'..."):
+    if st.button("📡 Fetch & index news", disabled=not company_valid):
+        with st.spinner(f"Pulling the latest feed and filtering for '{company_name_clean}'..."):
             try:
-                n_chunks, matches, total_fetched = index_company_news(company_name, chunk_size, chunk_overlap)
+                n_chunks, matches, total_fetched = index_company_news(
+                    company_name_clean, chunk_size, chunk_overlap
+                )
             except Exception as e:
                 st.error(f"Could not reach the news API: {e}")
                 n_chunks, matches, total_fetched = 0, [], 0
@@ -393,7 +440,7 @@ with st.sidebar:
             st.success(f"Indexed {n_chunks} chunks from {len(matches)} matching article(s) (out of {total_fetched} fetched).")
         elif total_fetched:
             st.warning(
-                f"No articles mentioning '{company_name}' were found in the latest {total_fetched} articles. "
+                f"No articles specifically about '{company_name_clean}' were found in the latest {total_fetched} articles. "
                 "The feed only covers recent general news, not a full historical company search."
             )
 
@@ -440,13 +487,14 @@ st.markdown(
 
 st.markdown(
     '<div class="nd-warn">Note: the news feed only returns the latest ~100 articles across all topics — '
-    "it's not a full historical search. If a company hasn't been in recent headlines, no matches will be found.</div>",
+    "it's not a full historical search. If a company hasn't been in recent headlines, no matches will be found. "
+    "Analysis is always scoped to exactly one company at a time.</div>",
     unsafe_allow_html=True,
 )
 
 if not st.session_state.vectorstore_ready:
     st.markdown(
-        '<div class="nd-empty">No news indexed yet.<br>Type a company name in the sidebar and click '
+        '<div class="nd-empty">No news indexed yet.<br>Type a single company name in the sidebar and click '
         '<b>Fetch &amp; index news</b> to begin.</div>',
         unsafe_allow_html=True,
     )
