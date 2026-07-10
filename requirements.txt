@@ -1,0 +1,9 @@
+streamlit
+langchain
+langchain-mistralai
+langchain-community
+langchain-text-splitters
+chromadb
+python-dotenv
+requests
+beautifulsoup4
